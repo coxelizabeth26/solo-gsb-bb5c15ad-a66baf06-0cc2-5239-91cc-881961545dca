@@ -9,12 +9,15 @@ key itself and never raw share bytes.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
+
+from . import audit
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -54,6 +57,24 @@ CREATE TABLE IF NOT EXISTS idempotency (
     session_id       TEXT NOT NULL,
     request_hash     TEXT NOT NULL,
     created_at       TEXT NOT NULL
+);
+
+-- Append-only, tamper-evident audit chain. One gap-free sequence per session;
+-- the PRIMARY KEY makes a duplicate sequence impossible to commit, and every
+-- insert happens inside a BEGIN IMMEDIATE transaction so concurrent writers
+-- serialise and can never fork the chain. Only non-sensitive metadata is kept:
+-- event type, timestamp and a small structured result -- never key material or
+-- share bytes.
+CREATE TABLE IF NOT EXISTS session_audit_events (
+    session_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    event_type  TEXT NOT NULL,
+    event_time  TEXT NOT NULL,
+    result      TEXT,
+    prev_hash   TEXT NOT NULL,
+    event_hash  TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq),
+    FOREIGN KEY (session_id) REFERENCES sessions (id)
 );
 """
 
@@ -183,6 +204,15 @@ class Database:
                     for idx, digest in sorted(share_checksums.items())
                 ],
             )
+            self._append_audit_event(
+                audit.EVENT_SESSION_CREATED,
+                session_id,
+                {
+                    "threshold": threshold,
+                    "total_shares": total_shares,
+                    "status": "active",
+                },
+            )
             if idempotency_key is not None:
                 self._conn.execute(
                     "INSERT INTO idempotency (idempotency_key, session_id, "
@@ -274,6 +304,29 @@ class Database:
                     for idx, digest in sorted(share_checksums.items())
                 ],
             )
+            # Both audit links are part of the rotation transaction: if
+            # anything fails the old session's chain and the new session
+            # itself disappear together with the rotation.
+            self._append_audit_event(
+                audit.EVENT_ROTATED,
+                old_session_id,
+                {
+                    "status": "rotated",
+                    "replacement_session_id": new_session_id,
+                    "threshold": threshold,
+                    "total_shares": total_shares,
+                },
+            )
+            self._append_audit_event(
+                audit.EVENT_SESSION_CREATED,
+                new_session_id,
+                {
+                    "threshold": threshold,
+                    "total_shares": total_shares,
+                    "status": "active",
+                    "replaces_session_id": old_session_id,
+                },
+            )
             if idempotency_key is not None:
                 self._conn.execute(
                     "INSERT INTO idempotency (idempotency_key, session_id, "
@@ -300,32 +353,115 @@ class Database:
             ).fetchall()
         return [r["share_index"] for r in rows]
 
-    def mark_submitted(self, session_id: str, x: int) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
+    def record_share_submission(
+        self,
+        session_id: str,
+        accepted: list[int],
+        rejected_count: int,
+        outcome: str,
+    ) -> dict[str, Any]:
+        """Apply one share-submission request as a single transaction.
+
+        Records the accepted share indices (progress display), bumps the failed
+        attempt counter whenever the request contains rejected shares, flips the
+        session to ``recovered`` when the threshold is reached, and appends the
+        non-sensitive audit events -- all atomically. ``outcome`` is one of
+        ``"accepted"`` / ``"rejected"`` / ``"recovered"`` and is the only
+        result detail stored.
+
+        Raises :class:`SessionStateError` if the session is no longer active by
+        the time the write transaction starts (a concurrent revoke/rotation/
+        recovery won), leaving nothing behind.
+        """
+        now = utcnow()
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT status FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise SessionStateError("session_not_found")
+            if row["status"] != "active":
+                raise SessionStateError(row["status"])
+
+            self._conn.executemany(
                 "INSERT OR IGNORE INTO submitted_shares "
                 "(session_id, share_index, created_at) VALUES (?, ?, ?)",
-                (session_id, x, utcnow()),
+                [(session_id, x, now) for x in accepted],
+            )
+            if rejected_count > 0:
+                # Preserve the original semantics: any request carrying a
+                # rejected share bumps the failed-attempt counter, even when
+                # the same request also reaches the threshold and recovers.
+                self._conn.execute(
+                    "UPDATE sessions SET recovery_attempts = "
+                    "recovery_attempts + 1 WHERE id = ?",
+                    (session_id,),
+                )
+
+            self._append_audit_event(
+                audit.EVENT_SHARES_SUBMITTED,
+                session_id,
+                {
+                    "outcome": outcome,
+                    "accepted_count": len(accepted),
+                    "rejected_count": rejected_count,
+                },
             )
 
-    def bump_attempt(self, session_id: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE sessions SET recovery_attempts = recovery_attempts + 1 "
-                "WHERE id = ?",
-                (session_id,),
-            )
+            recovered_at: str | None = None
+            if outcome == "recovered":
+                recovered_at = now
+                cur = self._conn.execute(
+                    "UPDATE sessions SET status = 'recovered', "
+                    "recovered_at = ? WHERE id = ? AND status = 'active'",
+                    (now, session_id),
+                )
+                if cur.rowcount != 1:
+                    raise SessionStateError("concurrent_state_change")
+                self._append_audit_event(
+                    audit.EVENT_RECOVERED,
+                    session_id,
+                    {"status": "recovered"},
+                )
 
-    def mark_recovered(self, session_id: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE sessions SET status = 'recovered', recovered_at = ? "
+        return {"recovered_at": recovered_at}
+
+    def revoke_session_with_audit(self, session_id: str) -> bool:
+        """Idempotent revoke inside a transaction with an audit event.
+
+        Returns True when *this* call performs the active -> revoked
+        transition (and appends the event); False on an idempotent repeat where
+        the session was already revoked (no event, no duplicate sequence).
+        Raises :class:`SessionStateError` if the session concurrently left the
+        revocable state (recovered/rotated).
+        """
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT status FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise SessionStateError("session_not_found")
+            if row["status"] == "revoked":
+                return False
+            if row["status"] != "active":
+                raise SessionStateError(row["status"])
+            now = utcnow()
+            cur = self._conn.execute(
+                "UPDATE sessions SET status = 'revoked', revoked_at = ? "
                 "WHERE id = ? AND status = 'active'",
-                (utcnow(), session_id),
+                (now, session_id),
             )
+            if cur.rowcount != 1:
+                raise SessionStateError("concurrent_state_change")
+            self._append_audit_event(
+                audit.EVENT_REVOKED,
+                session_id,
+                {"status": "revoked"},
+            )
+            return True
 
     def revoke_session(self, session_id: str) -> bool:
-        """Idempotent revoke. Returns True if revoked by this call."""
+        """Idempotent revoke without an audit event (low-level helper)."""
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE sessions SET status = 'revoked', revoked_at = ? "
@@ -334,6 +470,71 @@ class Database:
             )
             return cur.rowcount == 1
 
+    # ---- audit chain ----------------------------------------------------
+
+    def _append_audit_event(
+        self,
+        event_type: str,
+        session_id: str | None = None,
+        result: Any = None,
+    ) -> None:
+        """Append one audit link to a session's chain.
+
+        MUST be called while the caller already holds a write transaction
+        (``BEGIN IMMEDIATE``): the event then commits and rolls back together
+        with the business change it describes. The next sequence number is
+        derived from ``MAX(seq)`` under that write lock, so concurrent
+        transactions serialise and can neither reuse a number nor fork.
+        """
+        if session_id is None:
+            raise ValueError("session_id is required")
+        if event_type not in audit.EVENT_TYPES:
+            raise ValueError(f"unknown audit event type: {event_type}")
+        row = self._conn.execute(
+            "SELECT seq, event_hash FROM session_audit_events "
+            "WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            seq = 1
+            prev_hash = audit.GENESIS_HASH
+        else:
+            seq = row["seq"] + 1
+            prev_hash = row["event_hash"]
+        event_time = utcnow()
+        result_text = (
+            None if result is None else json.dumps(result, sort_keys=True)
+        )
+        event_hash = audit.compute_hash(
+            prev_hash, session_id, seq, event_type, event_time, result
+        )
+        # The PRIMARY KEY (session_id, seq) is the final guard: even if two
+        # writers computed the same seq, only one INSERT can commit.
+        self._conn.execute(
+            "INSERT INTO session_audit_events (session_id, seq, event_type, "
+            "event_time, result, prev_hash, event_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                seq,
+                event_type,
+                event_time,
+                result_text,
+                prev_hash,
+                event_hash,
+            ),
+        )
+
+    def get_audit_events(self, session_id: str) -> list[sqlite3.Row]:
+        """All audit rows for one session in chain order."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT session_id, seq, event_type AS type, event_time AS time, "
+                "result, prev_hash, event_hash FROM session_audit_events "
+                "WHERE session_id = ? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+
 
 class IdempotencyConflict(Exception):
     """An idempotency key was reused with a different request payload."""
@@ -341,6 +542,15 @@ class IdempotencyConflict(Exception):
 
 class RotationStateError(Exception):
     """The old session left the active state while rotation was committing."""
+
+
+class SessionStateError(Exception):
+    """A session changed state concurrently with a state-changing request.
+
+    The argument is the status (or a sentinel such as ``session_not_found``)
+    observed inside the write transaction so the caller can map it to the right
+    API error; nothing was written.
+    """
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

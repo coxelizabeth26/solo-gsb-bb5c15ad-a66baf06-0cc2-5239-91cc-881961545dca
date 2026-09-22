@@ -16,11 +16,12 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 
-from . import sharing
+from . import audit, sharing
 from .database import (
     Database,
     IdempotencyConflict,
     RotationStateError,
+    SessionStateError,
     row_to_dict,
     share_digest,
 )
@@ -330,6 +331,52 @@ def get_session(session_id: str, database: Database = Depends(db)):
     }
 
 
+@app.get(
+    "/api/v1/sessions/{session_id}/audit",
+    tags=["sessions"],
+    dependencies=[Depends(require_api_key)],
+)
+def get_session_audit(session_id: str, database: Database = Depends(db)):
+    """Return the session's tamper-evident audit chain in sequence order.
+
+    Every event is recomputed against ``SHA-256(prev_hash + canonical
+    content)``. ``valid`` covers the whole chain; when any historical field or
+    previous hash has been altered, ``first_invalid_seq`` pinpoints the first
+    broken link and every later event is flagged ``chain_broken``. Events carry
+    only the session id, type, timestamp and a non-sensitive result -- never
+    key material or shares.
+    """
+    row = database.get_session(session_id)
+    if row is None:
+        raise error("session_not_found", "recovery session does not exist", 404)
+    events = database.get_audit_events(session_id)
+    report = audit.verify_chain(events)
+    return {
+        "session_id": session_id,
+        "valid": report["valid"],
+        "length": report["length"],
+        "first_invalid_seq": report["first_invalid_seq"],
+        "first_invalid_reason": report["first_invalid_reason"],
+        "events": [
+            {
+                "seq": item["seq"],
+                "type": item["type"],
+                "time": item["time"],
+                "result": item["result"],
+                "prev_hash": item["prev_hash"],
+                "event_hash": item["event_hash"],
+                "valid": item["valid"],
+                **(
+                    {"invalid_reason": item["invalid_reason"]}
+                    if not item["valid"]
+                    else {}
+                ),
+            }
+            for item in report["events"]
+        ],
+    }
+
+
 @app.post(
     "/api/v1/sessions/{session_id}/shares",
     tags=["sessions"],
@@ -373,15 +420,70 @@ def submit_shares(
     threshold = row["threshold"]
     valid, rejected = verify_share_tokens(database, session_id, row, payload.shares)
 
-    if rejected:
-        database.bump_attempt(session_id)
+    # Decide the non-sensitive outcome BEFORE opening the write transaction:
+    # interpolation only reads the (already authenticated) share bytes and the
+    # transaction then atomically persists progress, status and audit events.
+    outcome: str
+    recovered: bytes | None = None
+    recovered_digest: str | None = None
+    if len(valid) < threshold:
+        outcome = "rejected" if rejected else "accepted"
+    else:
+        # Every point in `valid` is individually authenticated against the
+        # stored digest, so interpolation operates only on genuine shares.
+        chosen = sorted(valid.items())[:threshold]
+        recovered = sharing.reconstruct_secret(
+            [(x, y) for x, y in chosen]
+        )
+        recovered_digest = hashlib.sha256(recovered).hexdigest()
+        if hmac.compare_digest(recovered_digest, row["key_digest"]):
+            outcome = "recovered"
+        else:
+            outcome = "rejected"
 
-    for x in valid:
-        database.mark_submitted(session_id, x)
+    try:
+        database.record_share_submission(
+            session_id,
+            accepted=sorted(valid),
+            rejected_count=len(rejected),
+            outcome=outcome,
+        )
+    except SessionStateError as exc:
+        # A concurrent revoke/rotation/recovery changed the session while this
+        # request was verifying shares; the transaction wrote nothing.
+        current = database.get_session(session_id)
+        code = {
+            "revoked": ("session_revoked", "session has been revoked", 409),
+            "rotated": (
+                "session_rotated",
+                "session has been rotated; recovery is permanently disabled",
+                409,
+            ),
+            "recovered": (
+                "session_recovered",
+                "session was recovered by a concurrent request",
+                409,
+            ),
+        }.get(str(exc), ("session_state_changed", "session state changed", 409))
+        err = error(code[0], code[1], code[2])
+        if current is not None and current["status"] == "rotated":
+            err.detail["details"] = {
+                "replacement_session_id": current["replacement_session_id"]
+            }
+        raise err
 
     submitted_indices = database.submitted_indices(session_id)
 
-    if len(valid) < threshold:
+    if outcome != "recovered":
+        # Defence in depth for the checksum mismatch case: this cannot happen
+        # with t valid shares, but never return a value whose checksum does
+        # not match. The failed attempt was recorded in the same transaction.
+        if len(valid) >= threshold:
+            raise error(
+                "recovery_failed",
+                "reconstructed key failed checksum verification",
+                400,
+            )
         return {
             "session_id": session_id,
             "status": "active",
@@ -396,24 +498,6 @@ def submit_shares(
             "shares together in a single request",
         }
 
-    # Every point in `valid` is individually authenticated against the stored
-    # digest, so interpolation operates only on genuine shares.
-    chosen = sorted(valid.items())[:threshold]
-    recovered = sharing.reconstruct_secret(
-        [(x, y) for x, y in chosen]
-    )
-    recovered_digest = hashlib.sha256(recovered).hexdigest()
-    if not hmac.compare_digest(recovered_digest, row["key_digest"]):
-        # Defence in depth: cannot happen with t valid shares, but never
-        # return a value whose checksum does not match.
-        database.bump_attempt(session_id)
-        raise error(
-            "recovery_failed",
-            "reconstructed key failed checksum verification",
-            400,
-        )
-
-    database.mark_recovered(session_id)
     encoding = row["key_encoding"]
     try:
         key_text = encode_key(recovered, encoding)
@@ -458,7 +542,27 @@ def revoke_session(session_id: str, database: Database = Depends(db)):
             "a rotated session is already terminal and cannot be revoked",
             409,
         )
-    changed = database.revoke_session(session_id)
+    try:
+        changed = database.revoke_session_with_audit(session_id)
+    except SessionStateError as exc:
+        state = str(exc)
+        if state == "recovered":
+            raise error(
+                "session_not_revocable",
+                "a recovered session cannot be revoked",
+                409,
+            )
+        if state == "rotated":
+            raise error(
+                "session_not_revocable",
+                "a rotated session is already terminal and cannot be revoked",
+                409,
+            )
+        raise error(
+            "session_state_changed",
+            "session state changed concurrently; revoke was not applied",
+            409,
+        )
     row = database.get_session(session_id)
     return {
         "session_id": session_id,

@@ -21,6 +21,7 @@
 | 会话可撤销 | 撤销后任何提交分片请求被拒绝（409）；撤销操作本身幂等 |
 | 会话可轮换 | 凭达到旧阈值且校验通过的分片，可在**同一事务**中以新 `(t, n)` 重新分片：旧会话转为 `rotated` 并永久拒绝恢复，新会话分片只返回一次；轮换失败不留任何副作用 |
 | 操作幂等 | 创建会话支持 `Idempotency-Key`（请求头或请求体）；同键同参数重放返回同一会话且不再返回分片；同键不同参数返回 409 |
+| 审计防篡改 | 创建、分片提交、恢复成功、撤销、轮换均在**同一业务事务**内向仅追加审计链追加事件；事件只含会话标识、类型、时间与非敏感结果（无密钥、无分片），以连续序号与 `SHA-256(prev_hash + 规范化内容)` 串联；可按会话查询并自动校验整链，任一字段或前序哈希被改动都会定位首个失效序号 |
 | 可选 API Key | 设置 `DR_API_KEY` 后，`/api/v1/*` 需携带 `X-API-Key`（默认关闭，开箱即用） |
 
 > 注意：按阈值方案设计，**重建所需的全部 `t` 份分片必须在同一次提交请求中给出**
@@ -35,8 +36,9 @@
 │   ├── main.py        # FastAPI 路由、请求/响应模型、鉴权
 │   ├── sharing.py     # Shamir 拆分/重建、分片令牌编解码
 │   ├── gf256.py       # GF(2^8) 有限域运算（AES 多项式 0x11b）
-│   └── database.py    # SQLite 建表与事务
-├── tests/             # pytest：75+ 用例（域运算/拆分/API 全流程/轮换/安全场景）
+│   ├── audit.py       # 审计事件规范化、SHA-256 哈希链与整链校验
+│   └── database.py    # SQLite 建表与事务（含 session_audit_events）
+├── tests/             # pytest：100+ 用例（域运算/拆分/API 全流程/轮换/审计链/安全场景）
 ├── entrypoint.sh      # 启动前初始化数据库，然后起 uvicorn
 ├── Dockerfile
 ├── docker-compose.yml
@@ -77,6 +79,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/sessions/{id}/shares` | 校验分片并在达到阈值时重建密钥 |
 | POST | `/api/v1/sessions/{id}/rotate` | 凭旧阈值分片以新 `(t, n)` 轮换会话（幂等、事务性） |
 | POST | `/api/v1/sessions/{id}/revoke` | 撤销会话（幂等） |
+| GET  | `/api/v1/sessions/{id}/audit` | 查询会话审计链（按序返回事件与整链 `valid` 状态） |
 
 所有错误响应统一为：
 
@@ -236,6 +239,65 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/a1b2…/rotate \
   `session_revoked` / `session_not_rotatable` / `session_rotated`。
 - 轮换可以链式进行：新会话之后仍可再次轮换。
 
+### 6. 查询防篡改审计链
+
+每一次**状态变更**都会在原业务事务内向该会话的仅追加（append-only）审计链
+追加一条事件：
+
+| 状态变更 | 事件类型 | 记录的非敏感 `result` |
+| --- | --- | --- |
+| 创建会话 | `session_created` | `threshold` / `total_shares` / `status`（轮换产生的新会话另含 `replaces_session_id`） |
+| 提交分片 | `shares_submitted` | `outcome`（`accepted` / `rejected` / `recovered`）、`accepted_count`、`rejected_count` |
+| 恢复成功 | `recovered` | `status`（恢复当次在提交事件之后追加） |
+| 撤销 | `revoked` | `status` |
+| 轮换 | `rotated`（旧会话）+ `session_created`（新会话） | 新 `threshold` / `total_shares` 与 `replacement_session_id` |
+
+事件**不记录**密钥、密钥摘要以外的任何明文、原始分片或分片令牌；失败的校验
+只记录计数与结果码。幂等重放（重复撤销、恢复后再提交、创建/轮换幂等重放）
+不是状态变更，不产生新序号。
+
+```bash
+curl http://localhost:8000/api/v1/sessions/a1b2…/audit
+```
+
+```json
+{
+  "session_id": "a1b2…",
+  "valid": true,
+  "length": 4,
+  "first_invalid_seq": null,
+  "first_invalid_reason": null,
+  "events": [
+    {
+      "seq": 1,
+      "type": "session_created",
+      "time": "2026-09-22T10:00:00.000000Z",
+      "result": {"threshold": 2, "total_shares": 3, "status": "active"},
+      "prev_hash": "0000…0000",
+      "event_hash": "201bd14c…",
+      "valid": true
+    }
+  ]
+}
+```
+
+哈希链规则：
+
+- 每个会话序号从 **1** 开始连续递增，`PRIMARY KEY (session_id, seq)` 与
+  `BEGIN IMMEDIATE` 写事务共同保证并发写入不会产生重复序号或分叉；序号缺口、
+  重复序号同样会被判失效。
+- 事件内容规范化为「键排序、紧凑分隔的 ASCII JSON」，随后
+  `event_hash = SHA-256(prev_hash + 规范化内容)`；首条事件的 `prev_hash`
+  为 64 个 `0`。
+- 查询时服务端逐条重算哈希并核对前序指针。整链无误时 `valid: true`；任一
+  历史字段（类型/时间/结果）或前序哈希被改动，`valid: false` 且
+  `first_invalid_seq` 指向**首个**失效序号、`first_invalid_reason` 给出原因
+  （`hash_mismatch` / `prev_hash_mismatch` / `seq_gap` / `duplicate_seq`
+  等），其后的所有事件标记 `valid: false`、`invalid_reason: "chain_broken"`。
+- 审计事件与业务变更同事务提交/回滚：轮换失败整体回滚时不会留下审计事件。
+- 升级前创建的旧数据库启动时自动建立审计表；旧会话没有历史事件，空链视为
+  `valid: true`，此后的状态变更从序号 1 开始追加。
+
 ## 幂等性说明
 
 - **创建**：携带相同 `Idempotency-Key` 的重试返回同一个 `session_id`；首次响应
@@ -245,9 +307,11 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/a1b2…/rotate \
   （`shares: null`），同键不同请求返回 409。未携带 key 的轮换成功后无法重试——
   旧会话已转为 `rotated`，重复调用返回 409 `session_rotated`。
 - **撤销**：重复撤销是无害的 no-op。
-- **提交**：同一请求内重复索引被标记拒绝；恢复完成后重复提交不再次返回密钥。
+- **提交**：同一请求内重复索引被标记拒绝；恢复完成后重复提交不再次返回密钥，
+  也不产生新审计事件。
 - **服务重启**：表结构创建使用 `CREATE TABLE IF NOT EXISTS`，启动初始化可重复执行；
-  旧版本数据库启动时自动补齐 `rotated_at` / `replacement_session_id` 列。
+  旧版本数据库启动时自动补齐 `rotated_at` / `replacement_session_id` 列并建立
+  `session_audit_events` 审计表。
 
 ## 密码学实现说明
 
@@ -257,6 +321,9 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/a1b2…/rotate \
 - 重建：对每个字节在 0 处做拉格朗日插值，逐字节恢复。
 - 完整性：`share_digest = SHA256(session_id ‖ x ‖ '|' ‖ y)`，配合
   `hmac.compare_digest` 做常量时间比较。
+- 审计链：`event_hash = SHA256(prev_hash ‖ 规范化JSON{session_id, seq, type,
+  time, result})`，规范化形式为键排序、无多余空白的 ASCII JSON；首条事件锚定
+  64 个 `0`。审计列只有事件类型、时间、结构化结果码与两段哈希。
 
 ## 配置项（环境变量）
 
@@ -275,7 +342,9 @@ python -m pytest -q
 测试覆盖：域运算恒等式、20 组随机拆分/任意阈值子集恢复、低于阈值无法恢复、
 篡改/伪造/跨会话分片拒绝、恢复密钥只返回一次、撤销、创建与提交幂等、
 轮换全流程（成功/失败回滚/幂等重放/冲突/链式轮换/旧库迁移）、
-数据库不含密钥与原始分片等 75+ 断言。
+审计链（连续序号/五类事件/并发无重复无分叉/字段与前序哈希篡改定位首个失效序号/
+失败回滚不留事件/审计表不含密钥与原始分片）、数据库不含密钥与原始分片等
+100+ 断言。
 
 ## 部署注意事项
 
