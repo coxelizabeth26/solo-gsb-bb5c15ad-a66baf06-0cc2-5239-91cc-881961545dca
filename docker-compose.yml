@@ -1,0 +1,23 @@
+services:
+  api:
+    build: .
+    image: dr-key-sharding:latest
+    container_name: dr-key-sharding
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite database file inside the container (mounted volume below).
+      DR_DB_PATH: /data/sss.db
+      # Optional: set any non-empty value to require X-API-Key on /api/v1/*.
+      # DR_API_KEY: change-me-to-a-long-random-token
+    volumes:
+      - ss_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ss_data:
