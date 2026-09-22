@@ -300,7 +300,13 @@ def test_database_contains_no_secret_or_share_bytes(client):
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     )
-    for table in ("sessions", "session_shares", "submitted_shares", "idempotency"):
+    for table in (
+        "sessions",
+        "session_shares",
+        "submitted_shares",
+        "idempotency",
+        "audit_events",
+    ):
         rows = conn.execute(f"SELECT * FROM {table}").fetchall()
         text = json.dumps(rows, default=str)
         assert secret not in text

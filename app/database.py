@@ -4,6 +4,12 @@ A single connection guarded by a process-level lock is enough for the workload
 and makes "check then insert" transactions safe under uvicorn threads.
 Checksums (SHA-256) of individual shares and of the key are stored -- never the
 key itself and never raw share bytes.
+
+Every state-changing business transaction also appends an event to the
+tamper-evident audit chain (see :mod:`app.audit`): event rows are written inside
+the same ``BEGIN IMMEDIATE`` transaction as the business row changes, with a
+per-session contiguous sequence number, so the chain cannot fork or skip even
+under concurrent writers.
 """
 
 from __future__ import annotations
@@ -15,6 +21,8 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
+
+from . import audit
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -54,6 +62,24 @@ CREATE TABLE IF NOT EXISTS idempotency (
     session_id       TEXT NOT NULL,
     request_hash     TEXT NOT NULL,
     created_at       TEXT NOT NULL
+);
+
+-- Tamper-evident audit chain. Holds only non-sensitive metadata: session id,
+-- event type, UTC timestamp, a coarse result and small counters/links. Never
+-- holds keys, raw shares, tokens or share/key digests. Rows are appended
+-- inside the business transaction that caused the state change.
+CREATE TABLE IF NOT EXISTS audit_events (
+    session_id        TEXT NOT NULL,
+    seq               INTEGER NOT NULL,
+    event_type        TEXT NOT NULL,
+    occurred_at       TEXT NOT NULL,
+    result            TEXT NOT NULL,
+    details           TEXT NOT NULL DEFAULT '{}',
+    prev_hash         TEXT NOT NULL,
+    event_hash        TEXT NOT NULL,
+    canonical_content TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq),
+    FOREIGN KEY (session_id) REFERENCES sessions (id)
 );
 """
 
@@ -125,6 +151,58 @@ class Database:
         else:
             self._conn.execute("COMMIT")
 
+    def _append_audit_event(
+        self,
+        session_id: str,
+        event_type: str,
+        result: str,
+        details: dict[str, Any] | None = None,
+        occurred_at: str | None = None,
+    ) -> int:
+        """Append an audit event to a session's chain. MUST run inside an open
+        transaction (``BEGIN IMMEDIATE`` held by the caller), so the event is
+        committed and rolled back together with the business changes.
+
+        The next sequence number and predecessor hash are read while the write
+        transaction is held; the ``(session_id, seq)`` primary key is a final
+        backstop against duplicate sequence numbers.
+        """
+        ts = occurred_at or utcnow()
+        row = self._conn.execute(
+            "SELECT seq, event_hash FROM audit_events "
+            "WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            seq = 1
+            prev_hash = audit.GENESIS_HASH
+        else:
+            seq = row["seq"] + 1
+            prev_hash = row["event_hash"]
+
+        details = details or {}
+        content = audit.canonical_content(
+            session_id, seq, event_type, ts, result, details
+        )
+        event_hash = audit.build_event_hash(prev_hash, content)
+        self._conn.execute(
+            "INSERT INTO audit_events (session_id, seq, event_type, occurred_at, "
+            "result, details, prev_hash, event_hash, canonical_content) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                seq,
+                event_type,
+                ts,
+                result,
+                audit.canonical_details(details),
+                prev_hash,
+                event_hash,
+                content.decode("utf-8"),
+            ),
+        )
+        return seq
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -189,6 +267,17 @@ class Database:
                     "request_hash, created_at) VALUES (?, ?, ?, ?)",
                     (idempotency_key, session_id, request_hash, utcnow()),
                 )
+            # Genesis audit event: metadata only, no key or share material.
+            self._append_audit_event(
+                session_id,
+                audit.SESSION_CREATED,
+                audit.RESULT_CREATED,
+                {
+                    "threshold": threshold,
+                    "total_shares": total_shares,
+                    "created_by_rotation": False,
+                },
+            )
         return session_id, True
 
     def get_session(self, session_id: str) -> sqlite3.Row | None:
@@ -241,17 +330,19 @@ class Database:
                         raise IdempotencyConflict()
                     return row["session_id"], False
 
+            rotated_at = utcnow()
             cur = self._conn.execute(
                 "UPDATE sessions SET status = 'rotated', rotated_at = ?, "
                 "replacement_session_id = ? "
                 "WHERE id = ? AND status = 'active'",
-                (utcnow(), new_session_id, old_session_id),
+                (rotated_at, new_session_id, old_session_id),
             )
             if cur.rowcount != 1:
                 # Concurrent recovery/revoke/rotation won the race; abort so
                 # the caller can re-read the state. Nothing was written.
                 raise RotationStateError()
 
+            created_at = utcnow()
             self._conn.execute(
                 "INSERT INTO sessions (id, threshold, total_shares, key_digest, "
                 "key_encoding, key_length, status, created_at) "
@@ -263,7 +354,7 @@ class Database:
                     key_digest,
                     key_encoding,
                     key_length,
-                    utcnow(),
+                    created_at,
                 ),
             )
             self._conn.executemany(
@@ -280,6 +371,32 @@ class Database:
                     "request_hash, created_at) VALUES (?, ?, ?, ?)",
                     (idempotency_key, new_session_id, request_hash, utcnow()),
                 )
+
+            # Audit both sides of the rotation inside this one transaction;
+            # the new session's genesis event points back at its predecessor.
+            self._append_audit_event(
+                old_session_id,
+                audit.SESSION_ROTATED,
+                audit.RESULT_ROTATED,
+                {
+                    "replacement_session_id": new_session_id,
+                    "new_threshold": threshold,
+                    "new_total_shares": total_shares,
+                },
+                occurred_at=rotated_at,
+            )
+            self._append_audit_event(
+                new_session_id,
+                audit.SESSION_CREATED,
+                audit.RESULT_CREATED,
+                {
+                    "threshold": threshold,
+                    "total_shares": total_shares,
+                    "created_by_rotation": True,
+                    "previous_session_id": old_session_id,
+                },
+                occurred_at=created_at,
+            )
         return new_session_id, True
 
     def get_share_digest(self, session_id: str, x: int) -> str | None:
@@ -300,39 +417,153 @@ class Database:
             ).fetchall()
         return [r["share_index"] for r in rows]
 
-    def mark_submitted(self, session_id: str, x: int) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO submitted_shares "
-                "(session_id, share_index, created_at) VALUES (?, ?, ?)",
-                (session_id, x, utcnow()),
-            )
+    def commit_share_submission(
+        self,
+        session_id: str,
+        valid_indices: list[int],
+        rejected_count: int,
+        *,
+        recover: bool,
+    ) -> dict[str, Any]:
+        """Persist one verified share submission, atomically with audit events.
 
-    def bump_attempt(self, session_id: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE sessions SET recovery_attempts = recovery_attempts + 1 "
-                "WHERE id = ?",
+        Runs in a single ``BEGIN IMMEDIATE`` transaction:
+
+        * records every newly seen verified share index (INSERT OR IGNORE),
+        * bumps ``recovery_attempts`` when this submission contained rejected
+          shares (or the final reconstructed key failed its digest check),
+        * when ``recover`` is given, flips an ``active`` session to
+          ``recovered`` -- and appends ``shares_submitted`` followed by
+          ``session_recovered`` audit events; otherwise appends only
+          ``shares_submitted``.
+
+        Returns ``{"status", "submitted_indices", "newly_accepted",
+        "recovered"}``. If a concurrent terminal transition wins, ``status``
+        reports it and nothing is written (no events appended).
+        """
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT status FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None or row["status"] != "active":
+                # Concurrent recovery/revoke/rotation committed first; the
+                # caller treats this as a replay/conflict and returns no key.
+                return {
+                    "status": row["status"] if row else None,
+                    "submitted_indices": self.submitted_indices(session_id),
+                    "newly_accepted": 0,
+                    "recovered": False,
+                }
+
+            occurred_at = utcnow()
+            newly_accepted = 0
+            for x in valid_indices:
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO submitted_shares "
+                    "(session_id, share_index, created_at) VALUES (?, ?, ?)",
+                    (session_id, x, occurred_at),
+                )
+                newly_accepted += cur.rowcount
+
+            if rejected_count:
+                self._conn.execute(
+                    "UPDATE sessions SET recovery_attempts = "
+                    "recovery_attempts + 1 WHERE id = ?",
+                    (session_id,),
+                )
+
+            recovered = False
+            if recover:
+                cur = self._conn.execute(
+                    "UPDATE sessions SET status = 'recovered', recovered_at = ? "
+                    "WHERE id = ? AND status = 'active'",
+                    (occurred_at, session_id),
+                )
+                if cur.rowcount != 1:
+                    # Should be impossible after the status read above, but a
+                    # failed terminal flip must never masquerade as recovery.
+                    raise RotationStateError()
+                recovered = True
+
+            submitted = self._conn.execute(
+                "SELECT share_index FROM submitted_shares WHERE session_id = ? "
+                "ORDER BY share_index",
                 (session_id,),
-            )
+            ).fetchall()
 
-    def mark_recovered(self, session_id: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE sessions SET status = 'recovered', recovered_at = ? "
-                "WHERE id = ? AND status = 'active'",
-                (utcnow(), session_id),
+            # Audit event(s) in the very same transaction: a submission is
+            # logged first, and a successful recovery immediately afterwards.
+            result = (
+                audit.RESULT_RECOVERED if recover else audit.RESULT_PENDING
             )
+            self._append_audit_event(
+                session_id,
+                audit.SHARES_SUBMITTED,
+                result,
+                {
+                    "accepted_count": len(valid_indices),
+                    "newly_accepted": newly_accepted,
+                    "rejected_count": rejected_count,
+                    "submitted_total": len(submitted),
+                },
+                occurred_at=occurred_at,
+            )
+            if recovered:
+                self._append_audit_event(
+                    session_id,
+                    audit.SESSION_RECOVERED,
+                    audit.RESULT_RECOVERED,
+                    {"accepted_count": len(valid_indices)},
+                    occurred_at=occurred_at,
+                )
+
+        return {
+            "status": "recovered" if recovered else "active",
+            "submitted_indices": [r["share_index"] for r in submitted],
+            "newly_accepted": newly_accepted,
+            "recovered": recovered,
+        }
 
     def revoke_session(self, session_id: str) -> bool:
-        """Idempotent revoke. Returns True if revoked by this call."""
-        with self._lock, self._conn:
+        """Idempotent revoke. Returns True if revoked by this call.
+
+        The actual ``active -> revoked`` transition and its audit event are
+        written together in one transaction; a replay (already revoked) is a
+        no-op and appends nothing.
+        """
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT status FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None or row["status"] != "active":
+                return False
+            occurred_at = utcnow()
             cur = self._conn.execute(
                 "UPDATE sessions SET status = 'revoked', revoked_at = ? "
                 "WHERE id = ? AND status = 'active'",
-                (utcnow(), session_id),
+                (occurred_at, session_id),
             )
-            return cur.rowcount == 1
+            if cur.rowcount != 1:
+                # Lost a concurrent terminal transition; roll the no-op back.
+                return False
+            self._append_audit_event(
+                session_id,
+                audit.SESSION_REVOKED,
+                audit.RESULT_REVOKED,
+                {},
+                occurred_at=occurred_at,
+            )
+        return True
+
+    def get_audit_events(self, session_id: str) -> list[sqlite3.Row]:
+        """Raw audit rows for a session in chain order (empty list if none)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT session_id, seq, event_type, occurred_at, result, "
+                "details, prev_hash, event_hash, canonical_content "
+                "FROM audit_events WHERE session_id = ? ORDER BY seq ASC",
+                (session_id,),
+            ).fetchall()
 
 
 class IdempotencyConflict(Exception):

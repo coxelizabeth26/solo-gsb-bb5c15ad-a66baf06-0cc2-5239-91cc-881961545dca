@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 
-from . import sharing
+from . import audit, sharing
 from .database import (
     Database,
     IdempotencyConflict,
@@ -330,6 +330,46 @@ def get_session(session_id: str, database: Database = Depends(db)):
     }
 
 
+@app.get(
+    "/api/v1/sessions/{session_id}/audit",
+    tags=["sessions"],
+    dependencies=[Depends(require_api_key)],
+)
+def get_session_audit(session_id: str, database: Database = Depends(db)):
+    """Return the session's tamper-evident audit chain.
+
+    Events are listed in sequence order together with the whole-chain
+    ``valid`` state. If any historical field or predecessor hash has been
+    altered, ``chain.first_invalid_seq`` pinpoints the first failing event and
+    ``chain.failure_reason`` names the check that broke.
+    """
+    row = database.get_session(session_id)
+    if row is None:
+        raise error("session_not_found", "recovery session does not exist", 404)
+    rows = database.get_audit_events(session_id)
+    events, chain = audit.verify_chain(rows)
+    return {
+        "session_id": session_id,
+        "events": events,
+        "chain": chain,
+    }
+
+
+def _submit_replay(session_id: str, status: str) -> dict:
+    """Key-less answer when the session left 'active' while a request was in
+    flight (concurrent recovery/revoke/rotation)."""
+    return {
+        "session_id": session_id,
+        "status": status,
+        "recovered": status == "recovered",
+        "key": None,
+        "replay": True,
+        "message": "session state changed concurrently; the key is not returned",
+        "accepted_indices": [],
+        "rejected": [],
+    }
+
+
 @app.post(
     "/api/v1/sessions/{session_id}/shares",
     tags=["sessions"],
@@ -371,17 +411,23 @@ def submit_shares(
         }
 
     threshold = row["threshold"]
+    # Integrity verification is read-only; all writes (verified indices,
+    # attempt counter, recovery flip and the matching audit event(s)) happen
+    # in a single transaction below.
     valid, rejected = verify_share_tokens(database, session_id, row, payload.shares)
 
-    if rejected:
-        database.bump_attempt(session_id)
-
-    for x in valid:
-        database.mark_submitted(session_id, x)
-
-    submitted_indices = database.submitted_indices(session_id)
-
     if len(valid) < threshold:
+        outcome = database.commit_share_submission(
+            session_id,
+            sorted(valid),
+            len(rejected),
+            recover=False,
+        )
+        if outcome["status"] != "active":
+            # A concurrent request transitioned the session terminally.
+            return _submit_replay(session_id, outcome["status"])
+
+        submitted_indices = outcome["submitted_indices"]
         return {
             "session_id": session_id,
             "status": "active",
@@ -405,15 +451,31 @@ def submit_shares(
     recovered_digest = hashlib.sha256(recovered).hexdigest()
     if not hmac.compare_digest(recovered_digest, row["key_digest"]):
         # Defence in depth: cannot happen with t valid shares, but never
-        # return a value whose checksum does not match.
-        database.bump_attempt(session_id)
+        # return a value whose checksum does not match. The failed attempt is
+        # still recorded, atomically with a shares_submitted audit event.
+        database.commit_share_submission(
+            session_id,
+            sorted(valid),
+            len(rejected) + 1,
+            recover=False,
+        )
         raise error(
             "recovery_failed",
             "reconstructed key failed checksum verification",
             400,
         )
 
-    database.mark_recovered(session_id)
+    outcome = database.commit_share_submission(
+        session_id,
+        sorted(valid),
+        len(rejected),
+        recover=True,
+    )
+    if not outcome["recovered"]:
+        # A concurrent request transitioned the session (e.g. rotation); the
+        # key must not be shown. Surface the resulting status without it.
+        return _submit_replay(session_id, outcome["status"])
+
     encoding = row["key_encoding"]
     try:
         key_text = encode_key(recovered, encoding)

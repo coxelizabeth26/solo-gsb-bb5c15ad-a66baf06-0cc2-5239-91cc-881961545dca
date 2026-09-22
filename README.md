@@ -21,6 +21,7 @@
 | 会话可撤销 | 撤销后任何提交分片请求被拒绝（409）；撤销操作本身幂等 |
 | 会话可轮换 | 凭达到旧阈值且校验通过的分片，可在**同一事务**中以新 `(t, n)` 重新分片：旧会话转为 `rotated` 并永久拒绝恢复，新会话分片只返回一次；轮换失败不留任何副作用 |
 | 操作幂等 | 创建会话支持 `Idempotency-Key`（请求头或请求体）；同键同参数重放返回同一会话且不再返回分片；同键不同参数返回 409 |
+| 防篡改审计链 | 创建、分片提交、恢复成功、撤销与轮换均在**原业务事务内**追加审计事件；事件只含会话标识/类型/UTC 时间/非敏感结果与计数，绝不包含密钥、分片或摘要。事件按连续序号以 `SHA-256(prev_hash + 规范化内容)` 串联，历史字段或前序哈希一旦被改动即可定位首个失效序号 |
 | 可选 API Key | 设置 `DR_API_KEY` 后，`/api/v1/*` 需携带 `X-API-Key`（默认关闭，开箱即用） |
 
 > 注意：按阈值方案设计，**重建所需的全部 `t` 份分片必须在同一次提交请求中给出**
@@ -35,8 +36,9 @@
 │   ├── main.py        # FastAPI 路由、请求/响应模型、鉴权
 │   ├── sharing.py     # Shamir 拆分/重建、分片令牌编解码
 │   ├── gf256.py       # GF(2^8) 有限域运算（AES 多项式 0x11b）
-│   └── database.py    # SQLite 建表与事务
-├── tests/             # pytest：75+ 用例（域运算/拆分/API 全流程/轮换/安全场景）
+│   ├── audit.py       # 审计事件规范化、SHA-256 哈希链与整链校验
+│   └── database.py    # SQLite 建表、事务与审计链追加
+├── tests/             # pytest：100+ 用例（域运算/拆分/API/轮换/审计链/安全场景）
 ├── entrypoint.sh      # 启动前初始化数据库，然后起 uvicorn
 ├── Dockerfile
 ├── docker-compose.yml
@@ -77,6 +79,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/sessions/{id}/shares` | 校验分片并在达到阈值时重建密钥 |
 | POST | `/api/v1/sessions/{id}/rotate` | 凭旧阈值分片以新 `(t, n)` 轮换会话（幂等、事务性） |
 | POST | `/api/v1/sessions/{id}/revoke` | 撤销会话（幂等） |
+| GET  | `/api/v1/sessions/{id}/audit` | 按序返回审计事件及整链校验状态（含首个失效序号） |
 
 所有错误响应统一为：
 
@@ -236,6 +239,63 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/a1b2…/rotate \
   `session_revoked` / `session_not_rotatable` / `session_rotated`。
 - 轮换可以链式进行：新会话之后仍可再次轮换。
 
+### 6. 查询防篡改审计链
+
+会话的每次状态变更都会在**原业务事务内**追加一条审计事件——创建会话、提交
+分片（含部分提交与含错误分片的提交）、恢复成功、撤销、轮换。轮换会向旧会话
+追加 `session_rotated`、同时向新会话追加 `session_created` 两条事件；幂等重放
+与撤销重放是无状态变更的 no-op，不产生新事件。业务事务回滚（如轮换失败）时，
+审计事件一并回滚。
+
+```bash
+curl http://localhost:8000/api/v1/sessions/a1b2…/audit
+```
+
+```json
+{
+  "session_id": "a1b2…",
+  "events": [
+    {
+      "seq": 1,
+      "type": "session_created",
+      "timestamp": "2026-09-22T08:15:01.123456Z",
+      "result": "created",
+      "details": {"threshold": 3, "total_shares": 5, "created_by_rotation": false},
+      "prev_hash": "",
+      "event_hash": "565ad5a1…",
+      "valid": true
+    }
+  ],
+  "chain": {
+    "hash_algorithm": "SHA-256",
+    "valid": true,
+    "event_count": 1,
+    "first_invalid_seq": null,
+    "failure_reason": null
+  }
+}
+```
+
+链式规则与事件词汇：
+
+- `seq` 在**每个会话内**从 1 开始连续编号；`prev_hash` 为上一条事件的
+  `event_hash`（首条为空串），`event_hash = SHA-256(prev_hash + 规范化事件内容)`。
+  规范化内容为紧凑（无多余空白）、键名字典序排序的 JSON：
+  `{"details":{…},"result":"…","seq":1,"session_id":"…","timestamp":"…","type":"…"}`。
+- 并发写入由 `BEGIN IMMEDIATE` 写事务 + 进程锁串行化，并以
+  `(session_id, seq)` 主键兜底：不会出现重复序号、空号或分叉。
+- 事件类型：`session_created` / `shares_submitted` / `session_recovered` /
+  `session_revoked` / `session_rotated`；结果词汇为非敏感的
+  `created` / `pending` / `recovered` / `revoked` / `rotated`，`details` 只含
+  阈值、分片总数、接受/拒绝计数等小整数和接替会话标识，**不含密钥、原始分片、
+  令牌或任何摘要**。
+- 校验按序重算哈希；任一历史字段（含 `details`、时间、类型、结果）或前序哈希
+  被改动时，`chain.valid` 为 `false`，`first_invalid_seq` 指向**首个**失效序号，
+  `failure_reason` 给出失效检查：`event_content_tampered`（规范化内容不一致）、
+  `previous_hash_mismatch`（前序哈希被改）、`hash_mismatch`（事件哈希被改）或
+  `gap_or_duplicate_sequence`（事件被删/序号重复）。校验始终以库中前序哈希继续
+  向后比对，因此首个断点之后的事件不会被误报为新的首个断点。
+
 ## 幂等性说明
 
 - **创建**：携带相同 `Idempotency-Key` 的重试返回同一个 `session_id`；首次响应
@@ -247,7 +307,8 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/a1b2…/rotate \
 - **撤销**：重复撤销是无害的 no-op。
 - **提交**：同一请求内重复索引被标记拒绝；恢复完成后重复提交不再次返回密钥。
 - **服务重启**：表结构创建使用 `CREATE TABLE IF NOT EXISTS`，启动初始化可重复执行；
-  旧版本数据库启动时自动补齐 `rotated_at` / `replacement_session_id` 列。
+  旧版本数据库启动时自动补齐 `rotated_at` / `replacement_session_id` 列，并自动
+  创建 `audit_events` 审计表（旧会话此前无事件，空链视为 valid）。
 
 ## 密码学实现说明
 
@@ -257,6 +318,8 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/a1b2…/rotate \
 - 重建：对每个字节在 0 处做拉格朗日插值，逐字节恢复。
 - 完整性：`share_digest = SHA256(session_id ‖ x ‖ '|' ‖ y)`，配合
   `hmac.compare_digest` 做常量时间比较。
+- 审计链：`event_hash = SHA256(prev_hash ‖ 规范化事件内容)`，规范化事件内容为
+  键名排序、无多余空白的 UTF-8 JSON（见上文「查询防篡改审计链」）。
 
 ## 配置项（环境变量）
 
@@ -275,7 +338,9 @@ python -m pytest -q
 测试覆盖：域运算恒等式、20 组随机拆分/任意阈值子集恢复、低于阈值无法恢复、
 篡改/伪造/跨会话分片拒绝、恢复密钥只返回一次、撤销、创建与提交幂等、
 轮换全流程（成功/失败回滚/幂等重放/冲突/链式轮换/旧库迁移）、
-数据库不含密钥与原始分片等 75+ 断言。
+审计链（生命周期事件顺序、轮换双事件、回滚不留事件、哈希符合 SHA-256 规范、
+字段/时间/前序哈希/删行等篡改定位首个失效序号、并发序号连续无分叉、
+审计表不含密钥与原始分片、API Key 鉴权）等 100+ 断言。
 
 ## 部署注意事项
 
